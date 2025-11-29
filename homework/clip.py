@@ -1,8 +1,11 @@
 from pathlib import Path
 from typing import Any
 
+import math
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -101,14 +104,104 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+
+        # try to read hidden dims from encoder configs, fall back to common defaults
+        v_dim =  getattr(getattr(self.vision_encoder, "config", None), "hidden_size", None) or \
+                 getattr(getattr(self.vision_encoder, "config", None), "projection_dim", None) or 768
+        t_dim =  getattr(getattr(self.text_encoder, "config", None), "hidden_size", None) or \
+                 getattr(getattr(self.text_encoder, "config", None), "projection_dim", None) or 768
+
+        # projection heads
+        self.image_proj = nn.Linear(int(v_dim), proj_dim)
+        self.text_proj = nn.Linear(int(t_dim), proj_dim)
+
+        # logit scale parameter (stored as log to keep positive)
+        self.logit_scale = nn.Parameter(torch.tensor(np.log(1.0 / temperature), dtype=torch.float32))
+
+        # small initializer for projection layers
+        nn.init.normal_(self.image_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.text_proj.weight, mean=0.0, std=0.02)
+        if self.image_proj.bias is not None:
+            nn.init.zeros_(self.image_proj.bias)
+        if self.text_proj.bias is not None:
+            nn.init.zeros_(self.text_proj.bias)
+
+    def _encode_image_backbone(self, pixel_values: torch.Tensor):
+        """
+        Run the vision encoder and return a pooled vector (B, vision_dim).
+        Robust to backbones that return last_hidden_state or pooler_output.
+        """
+        # vision backbones typically accept pixel_values keyword and return a dict-like object
+        out = None
+        try:
+            out = self.vision_encoder(pixel_values=pixel_values, return_dict=True)
+        except TypeError:
+            # fallback: try positional
+            out = self.vision_encoder(pixel_values)
+        # attempt to extract pooled representation
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            feat = out.pooler_output
+        elif hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            # try CLS token first
+            last = out.last_hidden_state
+            feat = last[:, 0, :] if last.shape[1] > 0 else last.mean(dim=1)
+        elif isinstance(out, (tuple, list)) and len(out) > 0:
+            cand = out[0]
+            if hasattr(cand, "shape") and cand.ndim == 3:
+                feat = cand[:, 0, :]
+            else:
+                feat = torch.mean(torch.stack([torch.as_tensor(cand)]), dim=0)
+        else:
+            # as a last resort try to call the module directly on pixel_values and hope for (B, D)
+            feat = self.vision_encoder(pixel_values)
+            if isinstance(feat, (tuple, list)):
+                feat = feat[0]
+        return feat
+
+    def _encode_text_backbone(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
+        """
+        Run the text encoder and return a pooled vector (B, text_dim).
+        Use attention_mask-aware mean pooling if pooled output not available.
+        """
+        out = None
+        try:
+            out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        except TypeError:
+            out = self.text_encoder(input_ids, attention_mask)
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            feat = out.pooler_output
+        elif hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            last = out.last_hidden_state  # (B, L, D)
+            if attention_mask is None:
+                feat = last.mean(dim=1)
+            else:
+                mask = attention_mask.unsqueeze(-1).type_as(last)  # (B, L, 1)
+                summed = (last * mask).sum(dim=1)
+                denom = mask.sum(dim=1).clamp(min=1e-9)
+                feat = summed / denom
+        elif isinstance(out, (tuple, list)) and len(out) > 0:
+            cand = out[0]
+            if cand.ndim == 3:
+                feat = cand[:, 0, :]
+            else:
+                feat = cand.mean(dim=1)
+        else:
+            feat = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            if isinstance(feat, (tuple, list)):
+                feat = feat[0]
+        return feat
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+        feat = self._encode_image_backbone(image)
+        proj = self.image_proj(feat)
+        norm = F.normalize(proj, dim=-1)
+        return norm
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        feat = self._encode_text_backbone(input_ids, attention_mask)
+        proj = self.text_proj(feat)
+        norm = F.normalize(proj, dim=-1)
+        return norm
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Customize save method, save additional parameters"""
@@ -144,8 +237,14 @@ class CLIP(nn.Module):
         Enable gradient checkpointing for the vision and text backbones.
         (You don't need to touch this method)
         """
-        self.vision_encoder.gradient_checkpointing_enable(**kwargs)
-        self.text_encoder.gradient_checkpointing_enable(**kwargs)
+        try:
+            self.vision_encoder.gradient_checkpointing_enable(**kwargs)
+        except Exception:
+            pass
+        try:
+            self.text_encoder.gradient_checkpointing_enable(**kwargs)
+        except Exception:
+            pass
 
     def enable_input_require_grads(self):
         """
@@ -157,8 +256,14 @@ class CLIP(nn.Module):
         def make_inputs_require_grads(module, input, output):  # noqa: A002
             output.requires_grad_(True)
 
-        self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
-        self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
+        try:
+            self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
+        except Exception:
+            pass
+        try:
+            self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
+        except Exception:
+            pass
 
     def forward(
         self,
@@ -170,49 +275,72 @@ class CLIP(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
+
         Returns:
-            TODO: think about the what values should be returned
+            image_features (B, proj_dim), text_features (B, proj_dim), logits_per_image (B, B)
         """
-        raise NotImplementedError("Not implemented")
+        # encode
+        pixel_values = pixel_values.to(next(self.parameters()).device)
+        input_ids = input_ids.to(next(self.parameters()).device)
+        attention_mask = attention_mask.to(next(self.parameters()).device) if attention_mask is not None else None
+
+        image_features = self.encode_image(pixel_values)  # (B, D)
+        text_features = self.encode_text(input_ids=input_ids, attention_mask=attention_mask)  # (B, D)
+
+        # compute logits scaled by learnable temperature
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = torch.matmul(image_features, text_features.T) * logit_scale  # (B, B)
+
+        return image_features, text_features, logits_per_image
 
 
-def compute_clip_loss(
-    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    labels: torch.Tensor,
-    num_items_in_batch: int | None = None,
-) -> torch.Tensor:
+def compute_clip_loss(*args, **kwargs):
     """
-    Compute the loss for the CLIP model.
-    Args:
-        outputs: A tuple containing the outputs of CLIP.forward().
-        labels: The labels for the text features.
-        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-        num_items_in_batch: The number of items in the batch.
-        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
-    Returns:
-        The loss for the CLIP model.
+    Flexible compute function:
+    - If called as compute_clip_loss(model, inputs) (Trainer style), run forward and compute symmetric CE.
+    - If called as compute_clip_loss(outputs, labels, ...) compute loss from precomputed outputs.
     """
-    raise NotImplementedError("Not implemented")
+    # Trainer style: (model, inputs)
+    if len(args) >= 2 and hasattr(args[0], "parameters"):
+        model = args[0]
+        inputs = args[1]
+        pixel_values = inputs["pixel_values"].to(next(model.parameters()).device)
+        input_ids = inputs["input_ids"].to(next(model.parameters()).device)
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(next(model.parameters()).device)
+        outputs = model(pixel_values, input_ids, attention_mask)
+        # outputs: image_features, text_features, logits_per_image
+        _, _, logits_per_image = outputs
+        b = logits_per_image.shape[0]
+        labels = torch.arange(b, device=logits_per_image.device)
+        loss_i2t = F.cross_entropy(logits_per_image, labels)
+        loss_t2i = F.cross_entropy(logits_per_image.T, labels)
+        return (loss_i2t + loss_t2i) / 2.0
+
+    # legacy style: outputs, labels, num_items_in_batch
+    outputs = args[0]
+    if isinstance(outputs, (list, tuple)) and len(outputs) >= 3:
+        _, _, logits_per_image = outputs
+        b = logits_per_image.shape[0]
+        labels = torch.arange(b, device=logits_per_image.device)
+        loss_i2t = F.cross_entropy(logits_per_image, labels)
+        loss_t2i = F.cross_entropy(logits_per_image.T, labels)
+        return (loss_i2t + loss_t2i) / 2.0
+
+    raise RuntimeError("compute_clip_loss received unexpected arguments")
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
     target_modules = []
     for name, module in model.named_modules():
-        # if isinstance(module, nn.Linear) and ("vision_encoder" in name and "projection" not in name):
+        # capture nn.Linear modules inside the encoders (but not projection layers)
         if (
             isinstance(module, nn.Linear)
             and ("vision_encoder" in name or "text_encoder" in name)
             and "projection" not in name
         ):
             target_modules.append(name)
-
     return target_modules
 
 
@@ -285,7 +413,7 @@ def train(
         args=training_args,
         train_dataset=train_dataset,
         data_collator=clip_data_collator,
-        compute_loss_func=compute_clip_loss,
+        compute_loss=compute_clip_loss,  # Trainer expects a function (model, inputs) -> loss
     )
 
     trainer.train()

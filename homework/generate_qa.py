@@ -1,164 +1,162 @@
+# generate_qa.py (FAST MINIMAL VERSION — OPTION A)
+
 import json
-import random
 from pathlib import Path
-from PIL import Image, ImageDraw
+import fire
 
-TRAIN_DIR = Path("data/train")
 
-random.seed(17)
+ORIGINAL_WIDTH = 600
+ORIGINAL_HEIGHT = 400
 
-def load_info(path):
-    """Load info.json and fallback to detections if no objects field exists."""
-    with open(path, "r") as f:
+
+def extract_karts(info_path, view_index, img_width=150, img_height=100):
+    """Extract kart centers only. Minimal logic. No rendering."""
+    with open(info_path) as f:
         info = json.load(f)
 
-    if "objects" not in info:
-        dets = info.get("detections", [])
-        if not dets:
-            info["objects"] = []
-        else:
-            objs = []
-            for det in dets[0]:
-                class_id, track_id, x1, y1, x2, y2 = det
-                objs.append({
-                    "type": f"class_{int(class_id)}",
-                    "bbox": [x1, y1, x2, y2]
-                })
-            info["objects"] = objs
+    detections = info["detections"][view_index]
 
-    return info
+    karts = []
+    ego = None
+
+    scale_x = img_width / ORIGINAL_WIDTH
+    scale_y = img_height / ORIGINAL_HEIGHT
+
+    for det in detections:
+        class_id, track_id, x1, y1, x2, y2 = det
+        if class_id != 1:
+            continue
+
+        cx = ((x1 * scale_x) + (x2 * scale_x)) / 2
+        cy = ((y1 * scale_y) + (y2 * scale_y)) / 2
+
+        entry = {
+            "id": track_id,
+            "name": f"kart_{track_id}",
+            "cx": cx,
+            "cy": cy,
+        }
+
+        if track_id == 0:
+            ego = entry
+
+        karts.append(entry)
+
+    if ego is None and karts:
+        # fallback: choose the most central kart
+        ex, ey = img_width / 2, img_height / 2
+        ego = min(
+            karts,
+            key=lambda k: (k["cx"] - ex) ** 2 + (k["cy"] - ey) ** 2,
+        )
+
+    # mark ego
+    for k in karts:
+        k["is_ego"] = (k is ego)
+
+    return karts
 
 
-def get_spatial_relations(objs):
-    """
-    Determine which object is front/back/left/right of the ego car.
-    Using x-center only (SuperTuxKart scenes are roughly aligned).
-    """
-    if not objs:
-        return {"front": "nothing", "back": "nothing",
-                "left": "nothing", "right": "nothing"}
-
-    centers = []
-    for o in objs:
-        x1, y1, x2, y2 = o.get("bbox", [0, 0, 0, 0])
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
-        centers.append((cx, cy, o["type"]))
-
-    front = min(centers, key=lambda c: c[1])[2]
-    back = max(centers, key=lambda c: c[1])[2]
-    left = min(centers, key=lambda c: c[0])[2]
-    right = max(centers, key=lambda c: c[0])[2]
-
-    return {"front": front, "back": back, "left": left, "right": right}
+def extract_track(info_path):
+    with open(info_path) as f:
+        info = json.load(f)
+    return info.get("map_name") or info.get("track") or "unknown"
 
 
-def random_variant(options):
-    return random.choice(options)
+def generate_qa(info_path, view_index):
+    karts = extract_karts(info_path, view_index)
+    track = extract_track(info_path)
 
-def generate_questions(info, view_img_file):
-    objs = info["objects"]
-    num_objs = len(objs)
-    spatial = get_spatial_relations(objs)
+    ego = next(k for k in karts if k["is_ego"])
+    ex, ey = ego["cx"], ego["cy"]
 
-    qas = []
+    qa = []
 
-    count_questions = [
-        "How many objects are visible?",
-        "How many items are present in the scene?",
-        "Count the objects in this view.",
-        "What is the total number of detected objects?"
-    ]
-    qas.append({
-        "image_file": view_img_file,
-        "question": random_variant(count_questions),
-        "answer": str(num_objs)
+    # 1 — ego
+    qa.append({
+        "question": "What kart is the ego car?",
+        "answer": ego["name"],
     })
 
-    spatial_templates = {
-        "front": [
-            "What object is ahead of the kart?",
-            "What is in front of the kart?",
-            "Which object lies forward?",
-        ],
-        "back": [
-            "What object is behind the kart?",
-            "Which object lies backward?",
-            "What is located to the rear of the kart?",
-        ],
-        "left": [
-            "What object is left of the kart?",
-            "Which object appears on the left side?",
-        ],
-        "right": [
-            "What object is right of the kart?",
-            "Which object appears on the right side?",
-        ]
-    }
-
-    for direction, templates in spatial_templates.items():
-        qas.append({
-            "image_file": view_img_file,
-            "question": random_variant(templates),
-            "answer": spatial[direction]
-        })
-
-    type_counts = {}
-    for o in objs:
-        t = o["type"]
-        type_counts[t] = type_counts.get(t, 0) + 1
-
-    for t, ct in type_counts.items():
-        qas.append({
-            "image_file": view_img_file,
-            "question": f"How many {t} objects are present?",
-            "answer": str(ct)
-        })
-
-    caption_templates = [
-        "Describe the scene.",
-        "What is happening in the image?",
-        "What objects can you see?",
-        "Give a short caption for this scene.",
-        "Summarize what appears in this view."
-    ]
-    caption_answer = ", ".join([o["type"] for o in objs]) if objs else "an empty road"
-
-    qas.append({
-        "image_file": view_img_file,
-        "question": random_variant(caption_templates),
-        "answer": caption_answer
+    # 2 — count
+    qa.append({
+        "question": "How many karts are there in the scenario?",
+        "answer": str(len(karts)),
     })
 
-    return qas
+    # 3 — track
+    qa.append({
+        "question": "What track is this?",
+        "answer": track,
+    })
 
-def process_scene(info_file):
-    scene_id = info_file.stem.replace("_info", "")
+    # relative counts
+    left = right = front = behind = 0
 
-    # all images for scene
-    images = sorted(TRAIN_DIR.glob(f"{scene_id}_*_im.jpg"))
-    if not images:
-        print(f"No images for {scene_id}, skipping.")
-        return
+    # individual kart relative QAs
+    for k in karts:
+        if k["is_ego"]:
+            continue
 
-    info = load_info(info_file)
+        lr = "left" if k["cx"] < ex else "right"
+        fb = "in front" if k["cy"] < ey else "behind"
 
-    all_qas = []
-    for img in images:
-        rel_path = str(img.relative_to(TRAIN_DIR.parent))
-        qas = generate_questions(info, rel_path)
-        all_qas.extend(qas)
+        if lr == "left": left += 1
+        else: right += 1
 
-    out_path = TRAIN_DIR / f"{scene_id}_qa_pairs.json"
+        if fb == "in front": front += 1
+        else: behind += 1
+
+        qa.append({
+            "question": f"Is {k['name']} to the left or right of the ego car?",
+            "answer": lr,
+        })
+        qa.append({
+            "question": f"Is {k['name']} in front of or behind the ego car?",
+            "answer": fb,
+        })
+        qa.append({
+            "question": f"Where is {k['name']} relative to the ego car?",
+            "answer": f"{lr} and {fb}",
+        })
+
+    # final count QAs
+    qa.append({
+        "question": "How many karts are to the left of the ego car?",
+        "answer": str(left),
+    })
+    qa.append({
+        "question": "How many karts are to the right of the ego car?",
+        "answer": str(right),
+    })
+    qa.append({
+        "question": "How many karts are in front of the ego car?",
+        "answer": str(front),
+    })
+    qa.append({
+        "question": "How many karts are behind the ego car?",
+        "answer": str(behind),
+    })
+
+    return qa
+
+
+def write(info_file, view_index, output_dir):
+    info_file = Path(info_file)
+    base = info_file.stem.replace("_info", "")
+    out_path = Path(output_dir) / f"{base}_qa_pairs.json"
+
+    qa = generate_qa(info_file, int(view_index))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        json.dump(all_qas, f, indent=2)
+        json.dump(qa, f, indent=2)
 
-    print(f"Wrote {out_path} with {len(all_qas)} questions.")
+    print("Wrote:", out_path)
 
 
 def main():
-    for info_file in TRAIN_DIR.glob("*_info.json"):
-        process_scene(info_file)
+    fire.Fire({"write": write})
 
 
 if __name__ == "__main__":
