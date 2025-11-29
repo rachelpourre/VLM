@@ -1,161 +1,135 @@
+# homework/auto_generate_qa.py
 import json
-import random
 from pathlib import Path
+import random
+import fire
 
-DATA_DIR = Path("data")
-TRAIN_DIR = DATA_DIR / "train"
+from homework.generate_qa import generate_qa_pairs
 
-random.seed(17)
+# Defaults: these match your repo layout: data/train/*.jpg and *_info.json
+DEFAULT_DATA_DIR = "data"
+DEFAULT_TRAIN_SUBDIR = "train"
 
-def load_info(path):
-    """Load info.json. If no objects exist, convert detections."""
-    with open(path, "r") as f:
-        info = json.load(f)
+def _frame_id_from_scene(scene_name: str) -> str:
+    """
+    scene_name is the stem like '00048' or '00048_info' cleaned outside.
+    We will return it as-is (preserves hex).
+    """
+    return scene_name
 
-    if "objects" not in info:
-        dets = info.get("detections", [])
-        objs = []
-        if dets:
-            for det in dets[0]:
-                class_id, track_id, x1, y1, x2, y2 = det
-                objs.append({
-                    "type": f"class_{int(class_id)}",
-                    "bbox": [x1, y1, x2, y2]
-                })
-        info["objects"] = objs
+def process_info_json(
+    info_path: str,
+    data_dir: str = DEFAULT_DATA_DIR,
+    train_subdir: str = DEFAULT_TRAIN_SUBDIR,
+    max_relations: int = 4,
+    views: int = -1,          # -1 means all views; 1 means view 0 only
+    sample_seed: int = 17,
+    max_qas_per_image: int = None  # optional cap
+):
+    """
+    Process a single *_info.json file, generate QA pairs for each view/image,
+    and write <scene>_qa_pairs.json into the same train folder.
+    QA entries include "image_file" as a relative path starting with "train/..."
+    """
+    DATA_DIR = Path(data_dir)
+    TRAIN_DIR = DATA_DIR / train_subdir
 
-    return info
-
-def get_center(obj):
-    bbox = obj.get("bbox") or obj.get("box") or [0, 0, 0, 0]
-    x1, y1, x2, y2 = bbox
-    return ((x1 + x2) / 2, (y1 + y2) / 2)
-
-
-def get_spatial_relations(objs):
-    if not objs:
-        return {"front": "nothing", "back": "nothing",
-                "left": "nothing", "right": "nothing"}
-
-    centers = [(get_center(o), o["type"]) for o in objs]
-
-    front = min(centers, key=lambda c: c[0][1])[1]
-    back  = max(centers, key=lambda c: c[0][1])[1]
-    left  = min(centers, key=lambda c: c[0][0])[1]
-    right = max(centers, key=lambda c: c[0][0])[1]
-
-    return {"front": front, "back": back, "left": left, "right": right}
-
-
-def random_variant(options):
-    return random.choice(options)
-
-def generate_questions(info, rel_img_path):
-    objs = info["objects"]
-    num_objs = len(objs)
-    spatial = get_spatial_relations(objs)
-
-    qas = []
-
-    count_questions = [
-        "How many objects are visible?",
-        "How many items are present in the scene?",
-        "Count the objects in this view.",
-        "What is the total number of detected objects?"
-    ]
-    qas.append({
-        "image_file": rel_img_path,
-        "question": random_variant(count_questions),
-        "answer": str(num_objs)
-    })
-
-    spatial_templates = {
-        "front": [
-            "What object is ahead of the kart?",
-            "What is in front of the kart?",
-            "Which object lies forward?",
-        ],
-        "back": [
-            "What object is behind the kart?",
-            "Which object lies backward?",
-            "What is located to the rear of the kart?",
-        ],
-        "left": [
-            "What object is left of the kart?",
-            "Which object appears on the left side?",
-        ],
-        "right": [
-            "What object is right of the kart?",
-            "Which object appears on the right side?",
-        ]
-    }
-
-    for direction, templates in spatial_templates.items():
-        qas.append({
-            "image_file": rel_img_path,
-            "question": random_variant(templates),
-            "answer": spatial[direction]
-        })
-
-    type_counts = {}
-    for o in objs:
-        t = o["type"]
-        type_counts[t] = type_counts.get(t, 0) + 1
-
-    for t, ct in type_counts.items():
-        qas.append({
-            "image_file": rel_img_path,
-            "question": f"How many {t} objects are present?",
-            "answer": str(ct)
-        })
-
-    caption_templates = [
-        "Describe the scene.",
-        "What is happening in the image?",
-        "What objects can you see?",
-        "Give a short caption for this scene.",
-        "Summarize what appears in this view."
-    ]
-    caption_answer = ", ".join([o["type"] for o in objs]) if objs else "an empty road"
-
-    qas.append({
-        "image_file": rel_img_path,
-        "question": random_variant(caption_templates),
-        "answer": caption_answer
-    })
-
-    return qas
-
-def process_scene(info_file):
-    scene_id = info_file.stem.replace("_info", "")
-
-    images = sorted(TRAIN_DIR.glob(f"{scene_id}_*_im.jpg"))
-    if not images:
-        print(f"No images for {scene_id}, skipping.")
+    info_path = Path(info_path)
+    if not info_path.exists():
+        print("Info not found:", info_path)
         return
 
-    info = load_info(info_file)
-    all_qas = []
+    scene_id = info_path.stem.replace("_info", "")
+    all_images = sorted(TRAIN_DIR.glob(f"{scene_id}_*_im.*"))
 
-    for img in images:
-        rel_path = str(img.relative_to(DATA_DIR))  # gives "train/xxxx_im.jpg"
+    if not all_images:
+        print("No images found for", scene_id)
+        return
 
-        qas = generate_questions(info, rel_path)
-        all_qas.extend(qas)
+    # detect number of views from filenames (by splitting after scene_id)
+    # But simpler: if views == -1, process all images; else only views count (0..views-1)
+    if views is None or int(views) < 0:
+        process_view_indexes = sorted({int(p.name.split("_")[1]) for p in all_images})
+    else:
+        # user supplied number of views (e.g., 1 => only view 0)
+        v = int(views)
+        if v <= 0:
+            process_view_indexes = sorted({int(p.name.split("_")[1]) for p in all_images})
+        else:
+            process_view_indexes = list(range(v))
 
-    out_path = TRAIN_DIR / f"{scene_id}_qa_pairs.json"
-    with open(out_path, "w") as f:
-        json.dump(all_qas, f, indent=2)
+    rng = random.Random(sample_seed)
 
-    print(f"Wrote {out_path} with {len(all_qas)} QA items.")
+    all_qas_out = []
 
+    for view_idx in process_view_indexes:
+        # find image file for this view (take first matching extension)
+        candidates = sorted(TRAIN_DIR.glob(f"{scene_id}_{view_idx:02d}_im.*"))
+        if not candidates:
+            # no image for this view
+            continue
+        img_path = candidates[0]
+        rel_img_path = str(img_path.relative_to(DATA_DIR))  # yields "train/00048_00_im.jpg"
+
+        # call generate_qa_pairs - it expects info_path and view_index
+        qas = generate_qa_pairs(str(info_path), view_idx, max_relations=max_relations, sample_seed=sample_seed)
+
+        # optionally cap number of qa items per image
+        if max_qas_per_image is not None and len(qas) > max_qas_per_image:
+            # deterministic cap
+            qas = qas[:max_qas_per_image]
+
+        # attach image_file and push out
+        for qa in qas:
+            qa_out = {
+                "image_file": rel_img_path,
+                "question": qa["question"],
+                "answer": qa["answer"]
+            }
+            all_qas_out.append(qa_out)
+
+    # write output to TRAIN_DIR/<scene>_qa_pairs.json
+    out_file = TRAIN_DIR / f"{scene_id}_qa_pairs.json"
+    with open(out_file, "w") as f:
+        json.dump(all_qas_out, f, indent=2)
+
+    print(f"Wrote {out_file} ({len(all_qas_out)} QA pairs)")
+
+def run(
+    data_dir: str = DEFAULT_DATA_DIR,
+    train_subdir: str = DEFAULT_TRAIN_SUBDIR,
+    max_relations: int = 4,
+    views: int = -1,
+    sample_seed: int = 17,
+    max_qas_per_image: int = None
+):
+    """
+    Process all *_info.json in data/train and generate corresponding QA pair files.
+    Example:
+      python -m homework.auto_generate_qa run --data_dir data --train_subdir train --max_relations 4 --views 1
+    """
+    DATA_DIR = Path(data_dir)
+    TRAIN_DIR = DATA_DIR / train_subdir
+
+    info_files = sorted(TRAIN_DIR.glob("*_info.json"))
+    print(f"Found {len(info_files)} info files in {TRAIN_DIR}")
+
+    for info_path in info_files:
+        process_info_json(
+            str(info_path),
+            data_dir=data_dir,
+            train_subdir=train_subdir,
+            max_relations=max_relations,
+            views=views,
+            sample_seed=sample_seed,
+            max_qas_per_image=max_qas_per_image
+        )
 
 def main():
-    print("Generating QA pairs for all scenes in data/train ...")
-    for info_file in TRAIN_DIR.glob("*_info.json"):
-        process_scene(info_file)
-    print("Done.")
-
+    fire.Fire({
+        "process": process_info_json,
+        "run": run
+    })
 
 if __name__ == "__main__":
     main()
