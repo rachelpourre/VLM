@@ -38,7 +38,7 @@ def process_dir(data_dir: str, views: int = -1):
 
             out_entries.append({
                 "image_file": str(img_candidates[0].relative_to(data_dir.parent)),
-                "captions": caps,
+                "caption": " ".join(caps)
             })
 
         out_file = info_path.parent / f"{base}_captions.json"
