@@ -29,16 +29,16 @@
   "rank_pattern": {},
   "revision": null,
   "target_modules": [
-    "o_proj",
     "fc2",
-    "up_proj",
-    "q_proj",
-    "k_proj",
     "down_proj",
     "v_proj",
     "gate_proj",
-    "out_proj",
-    "fc1"
+    "fc1",
+    "k_proj",
+    "o_proj",
+    "up_proj",
+    "q_proj",
+    "out_proj"
   ],
   "target_parameters": null,
   "task_type": "FEATURE_EXTRACTION",
