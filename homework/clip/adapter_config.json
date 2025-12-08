@@ -25,16 +25,16 @@
   "rank_pattern": {},
   "revision": null,
   "target_modules": [
+    "fc2",
     "q_proj",
+    "down_proj",
+    "up_proj",
+    "o_proj",
+    "fc1",
+    "out_proj",
     "gate_proj",
     "v_proj",
-    "fc1",
-    "k_proj",
-    "fc2",
-    "up_proj",
-    "out_proj",
-    "o_proj",
-    "down_proj"
+    "k_proj"
   ],
   "task_type": "FEATURE_EXTRACTION",
   "trainable_token_indices": null,
